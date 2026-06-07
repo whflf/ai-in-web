@@ -1,0 +1,260 @@
+# Разделение сетей — frontend_net (Nginx, UI, API) и backend_net (API, Redis, Celery, PG, Ollama)
+# Управление постоянством данных — volumes для PostgreSQL, Redis, весов модели, Ollama
+# Порядок запуска — depends_on с condition: service_healthy
+# Compose Healthcheck — healthcheck для всех сервисов
+# Умный depends_on — condition: service_healthy
+# Горизонтальное масштабирование — Celery worker с deploy.replicas
+
+services:
+
+  # ─── PostgreSQL ────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    env_file: .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      # Управление постоянством данных — данные PostgreSQL в именованном volume
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - backend_net
+    # Compose Healthcheck — проверяем готовность PostgreSQL
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # ─── Redis ─────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      # Управление постоянством данных — данные Redis
+      - redis_data:/data
+    networks:
+      - backend_net
+    # Compose Healthcheck — проверяем Redis PING
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # ─── Ollama (локальный LLM) ────────────────────────────────────────────────────
+  # Управление постоянством данных — веса модели сохраняются в volume
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      # Управление постоянством данных — веса модели Ollama
+      - ollama_data:/root/.ollama
+    networks:
+      - backend_net
+    expose:
+      - "11434"
+    # Compose Healthcheck — Ollama готов когда отвечает на /api/tags
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+
+  # ─── Ollama model pull (one-shot) ──────────────────────────────────────────────
+  # Порядок запуска — скачиваем модель после старта Ollama
+  ollama_setup:
+    image: ollama/ollama:latest
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: ["ollama", "pull", "${OLLAMA_MODEL:-tinyllama}"]
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - backend_net
+    # Умный depends_on — ждём готовности Ollama
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: "no"
+
+  # ─── Alembic Migrations (one-shot) ────────────────────────────────────────────
+  migrations:
+    build:
+      context: ./backend
+      target: runtime
+    env_file: .env
+    command: alembic upgrade head
+    networks:
+      - backend_net
+    # Умный depends_on — ждём готовности PostgreSQL
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # ─── FastAPI Backend ───────────────────────────────────────────────────────────
+  api:
+    build:
+      context: ./backend
+      # Оптимизация сборок — собираем только runtime слой
+      target: runtime
+    env_file: .env
+    environment:
+      - API_BASE_URL=http://api:8000
+    networks:
+      # Разделение сетей — API доступен из обеих сетей
+      - frontend_net
+      - backend_net
+    expose:
+      - "8000"
+    # Compose Healthcheck — проверяем /api/health
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')\""]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    # Умный depends_on — ждём PostgreSQL, Redis и Ollama
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+      migrations:
+        condition: service_completed_successfully
+    # Горизонтальное масштабирование — две реплики API
+    deploy:
+      replicas: 2
+      restart_policy:
+        condition: on-failure
+        max_attempts: 3
+    restart: unless-stopped
+
+  # ─── Celery Worker ─────────────────────────────────────────────────────────────
+  celery_worker:
+    build:
+      context: ./backend
+      target: runtime
+    env_file: .env
+    # Graceful Shutdown — --max-tasks-per-child перезапускает воркер после N задач
+    command: celery -A app.celery_app worker --loglevel=info --concurrency=2 --max-tasks-per-child=100
+    networks:
+      - backend_net
+    # Порядок запуска — Celery Worker ждёт Redis, миграции и Ollama
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+      migrations:
+        condition: service_completed_successfully
+    # Горизонтальное масштабирование — несколько воркеров
+    deploy:
+      replicas: 2
+      restart_policy:
+        condition: on-failure
+    restart: unless-stopped
+
+  # ─── Streamlit Frontend ────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      target: runtime
+    env_file: .env
+    environment:
+      - API_BASE_URL=http://api:8000
+    networks:
+      # Разделение сетей — UI только в frontend_net, нет доступа к Redis/PG/Ollama
+      - frontend_net
+    expose:
+      - "8501"
+    # Порядок запуска — UI ждёт готовности API
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')\""]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # ─── Nginx Reverse Proxy ───────────────────────────────────────────────────────
+  nginx:
+    build:
+      context: ./nginx
+    ports:
+      # Единая точка входа — только порт 80 открыт наружу
+      - "80:80"
+    networks:
+      # Разделение сетей — Nginx только в frontend_net
+      - frontend_net
+    depends_on:
+      frontend:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ─── Prometheus ────────────────────────────────────────────────────────────────
+  # Grafana и Prometheus — мониторинг метрик
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    volumes:
+      - ./grafana/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+    networks:
+      - frontend_net
+      - backend_net
+    expose:
+      - "9090"
+    restart: unless-stopped
+
+  # ─── Grafana ───────────────────────────────────────────────────────────────────
+  # Grafana и Prometheus
+  grafana:
+    image: grafana/grafana:10.4.0
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    networks:
+      - frontend_net
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+# Управление постоянством данных — именованные volumes
+volumes:
+  postgres_data:
+  redis_data:
+  ollama_data:
+  prometheus_data:
+  grafana_data:
+
+# Разделение сетей — две изолированные сети
+networks:
+  frontend_net:
+    driver: bridge
+  backend_net:
+    driver: bridge

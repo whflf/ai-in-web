@@ -1,0 +1,16 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+.git/
+.gitignore
+*.log
+*.bin
+*.gguf
+*.safetensors
+models/
+.idea/
+.vscode/
+README.md
+PLAN.md
